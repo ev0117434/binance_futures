@@ -9,6 +9,7 @@ Rust-реализация writer'а для записи котировок Binan
 ## Особенности
 
 - Lock-free запись в SHM с использованием seqlock
+- SPSC ring buffer для асинхронного логирования в shared memory
 - Поддержка до 512 символов на одно WebSocket соединение
 - Автоматический reconnect с exponential backoff
 - Использование локального времени (UNIX microseconds)
@@ -33,8 +34,52 @@ cargo build --release
 
 ## Использование
 
+### Базовый запуск
 ```bash
 ./target/release/binance_futures_writer
+```
+
+### Запуск с CPU affinity (рекомендуется для production)
+```bash
+# Закрепить на конкретном CPU core (например, CPU 0)
+taskset -c 0 ./target/release/binance_futures_writer
+
+# Или на P-core для лучшей производительности
+taskset -c 2 ./target/release/binance_futures_writer
+```
+
+### Запуск как systemd service
+
+Создайте файл `/etc/systemd/system/binance-futures-writer.service`:
+
+```ini
+[Unit]
+Description=Binance Futures Writer
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/user/binance_futures
+ExecStart=/usr/bin/taskset -c 0 /home/user/binance_futures/target/release/binance_futures_writer
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Управление службой:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable binance-futures-writer
+sudo systemctl start binance-futures-writer
+sudo systemctl status binance-futures-writer
+
+# Просмотр логов
+sudo journalctl -u binance-futures-writer -f
 ```
 
 Программа автоматически:
@@ -42,6 +87,32 @@ cargo build --release
 2. Валидирует заголовок SHM файла
 3. Подключается к Binance Futures WebSocket
 4. Начинает записывать котировки в SHM
+
+## Логирование
+
+Программа использует SPSC ring buffer в shared memory для асинхронного логирования без блокировки hot-path:
+
+- **Ring buffer путь**: `/dev/shm/ring_spsc_binance_f_log`
+- **Размер**: 64K записей (настраивается в `src/logger.rs`)
+- **Формат**: Текстовые логи с timestamp в microseconds
+- **Типы событий**:
+  - `QUOTE` - каждая записанная котировка (symbol, bid, ask, timestamp)
+  - `CONNECTION` - события подключения/отключения WebSocket
+  - `ERROR` - ошибки с контекстом
+  - `WARNING` - предупреждения
+  - `INFO` - информационные сообщения
+
+### Чтение логов из ring buffer
+
+Для чтения логов можно использовать отдельную утилиту-reader, которая читает из ring buffer:
+
+```bash
+# Чтение и отображение логов в реальном времени
+# (требует реализации отдельного log_reader)
+./log_reader /dev/shm/ring_spsc_binance_f_log
+```
+
+Также критические события (ERROR, WARNING) дублируются в stderr для быстрого обнаружения проблем.
 
 ## Формат файлов конфигурации
 
@@ -108,6 +179,20 @@ struct Quote64 {
 - Используется seqlock для lock-free доступа
 - Парсинг decimal без float конвертации
 - Минимальные аллокации на hot-path
+- SPSC ring buffer для логирования не блокирует основной поток
+- Рекомендуется использовать CPU affinity для снижения jitter
+
+### Оптимизация для production
+
+1. **CPU Affinity**: Закрепите процесс на одном P-core
+2. **CPU Governor**: Установите `performance` mode
+   ```bash
+   echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+   ```
+3. **Transparent Hugepages**: Отключите для меньшего jitter
+   ```bash
+   echo never | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+   ```
 
 ## Примечания
 
