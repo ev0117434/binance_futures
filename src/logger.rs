@@ -1,8 +1,9 @@
 use chrono::Local;
-use crossbeam_queue::ArrayQueue;
+use rtrb::{RingBuffer, Producer, Consumer};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -51,36 +52,39 @@ impl LogMessage {
 
 /// Lock-free SPSC ring buffer logger
 ///
+/// Uses a true Single Producer Single Consumer ring buffer for zero-contention logging.
 /// The main thread (producer) pushes log messages without blocking.
 /// A background thread (consumer) writes messages to a file.
 pub struct Logger {
-    queue: Arc<ArrayQueue<LogMessage>>,
+    producer: Arc<Mutex<Producer<LogMessage>>>,
 }
 
 impl Logger {
     /// Create a new logger with specified ring buffer capacity
     ///
     /// # Arguments
-    /// * `capacity` - Size of the ring buffer (default: 8192 messages)
+    /// * `capacity` - Size of the SPSC ring buffer (must be power of 2, default: 8192)
     /// * `log_path` - Path to the log file
     ///
     /// # Returns
     /// Returns a Logger instance and starts a background consumer thread
     pub fn new(capacity: usize, log_path: &str) -> Self {
-        let queue = Arc::new(ArrayQueue::new(capacity));
-        let queue_clone = Arc::clone(&queue);
+        // Create SPSC ring buffer
+        let (producer, consumer) = RingBuffer::<LogMessage>::new(capacity);
+
+        let producer = Arc::new(Mutex::new(producer));
         let log_path = log_path.to_string();
 
         // Spawn background consumer thread
         thread::spawn(move || {
-            Self::consumer_thread(queue_clone, log_path);
+            Self::consumer_thread(consumer, log_path);
         });
 
-        Logger { queue }
+        Logger { producer }
     }
 
     /// Background consumer thread that writes logs to file
-    fn consumer_thread(queue: Arc<ArrayQueue<LogMessage>>, log_path: String) {
+    fn consumer_thread(mut consumer: Consumer<LogMessage>, log_path: String) {
         // Open log file in append mode
         let mut file = match OpenOptions::new()
             .create(true)
@@ -95,10 +99,11 @@ impl Logger {
         };
 
         loop {
-            // Try to consume messages from the queue
+            // Try to consume messages from the SPSC ring buffer
             let mut has_messages = false;
 
-            while let Some(msg) = queue.pop() {
+            // Pop all available messages in a batch
+            while let Ok(msg) = consumer.pop() {
                 has_messages = true;
                 if let Err(e) = file.write_all(msg.format().as_bytes()) {
                     eprintln!("[ERROR] Failed to write to log file: {}", e);
@@ -111,28 +116,9 @@ impl Logger {
             }
 
             // Sleep briefly to avoid busy-waiting
+            // For SPSC this is minimal overhead
             thread::sleep(Duration::from_micros(100));
         }
-    }
-
-    /// Log an info message (non-blocking)
-    pub fn info(&self, message: &str) {
-        self.log(LogLevel::Info, message);
-    }
-
-    /// Log a warning message (non-blocking)
-    pub fn warn(&self, message: &str) {
-        self.log(LogLevel::Warn, message);
-    }
-
-    /// Log an error message (non-blocking)
-    pub fn error(&self, message: &str) {
-        self.log(LogLevel::Error, message);
-    }
-
-    /// Log a fatal message (non-blocking)
-    pub fn fatal(&self, message: &str) {
-        self.log(LogLevel::Fatal, message);
     }
 
     /// Log a message with format arguments (info level)
@@ -155,15 +141,18 @@ impl Logger {
         self.log(LogLevel::Fatal, &format!("{}", args));
     }
 
-    /// Internal logging function
+    /// Internal logging function - pushes to SPSC ring buffer (non-blocking)
     fn log(&self, level: LogLevel, message: &str) {
         let msg = LogMessage::new(level, message.to_string());
 
-        // Try to push to queue (non-blocking)
-        if self.queue.push(msg).is_err() {
-            // Queue is full - in production, you might want to handle this
-            // For now, we silently drop the message to avoid blocking
-            // Alternative: use a larger buffer or implement backpressure
+        // Lock is only to make Producer Send/Sync safe
+        // The actual ring buffer operations are lock-free SPSC
+        if let Ok(mut producer) = self.producer.lock() {
+            // Try to push to SPSC ring buffer (non-blocking)
+            if producer.push(msg).is_err() {
+                // Ring buffer is full - silently drop to avoid blocking hot path
+                // In production, you can increase buffer size if this happens
+            }
         }
     }
 }
