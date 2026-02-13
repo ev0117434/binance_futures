@@ -9,7 +9,7 @@ Rust-реализация writer'а для записи котировок Binan
 ## Особенности
 
 - Lock-free запись в SHM с использованием seqlock
-- SPSC ring buffer для асинхронного логирования в shared memory
+- Асинхронное логирование через ring buffer (не блокирует hot-path)
 - Поддержка до 512 символов на одно WebSocket соединение
 - Автоматический reconnect с exponential backoff
 - Использование локального времени (UNIX microseconds)
@@ -90,53 +90,23 @@ sudo journalctl -u binance-futures-writer -f
 
 ## Логирование
 
-Программа использует **правильный SPSC ring buffer** в shared memory для асинхронного логирования без блокировки hot-path:
+Программа использует асинхронное логирование через внутренний ring buffer, который не блокирует hot-path:
 
-- **Ring buffer путь**: `/dev/shm/ring_spsc_binance_f_log`
-- **Размер**: 8192 слота (настраивается `SPSC_RING_SLOTS` в `src/logger.rs`)
-- **Размер сообщения**: Фиксированно 256 байт
-- **Формат**: Бинарный SPSC ring buffer с правильным ABI
+- **Лог файл**: `/dev/shm/ring_spsc_binance_f_log`
+- **Формат**: Текстовые логи с timestamp в microseconds
 - **Типы событий**:
-  - `INFO (1)` - информационные сообщения, включая записанные котировки
-  - `WARNING (2)` - предупреждения (отключения, parse failures)
-  - `ERROR (3)` - ошибки с контекстом
+  - `INFO` - информационные сообщения, включая записанные котировки
+  - `WARNING` - предупреждения (отключения, parse failures)
+  - `ERROR` - ошибки с контекстом
 
-### Спецификация SPSC Ring Buffer
-
-#### Header (128 байт)
-```
-magic:        0x53505343 ("SPSC")
-abi_version:  1
-msg_size:     256
-ring_slots:   8192 (степень двойки)
-data_offset:  128
-write_seq:    AtomicU64
-read_seq:     AtomicU64
-```
-
-#### Сообщение (256 байт)
-```
-[0-1]   abi_version: 1
-[2-3]   msg_type: 1=Info, 2=Warning, 3=Error
-[4-5]   msg_size: 256
-[6-7]   reserved
-[8-15]  timestamp_us
-[16-23] seq
-[24-27] payload_len (max 208)
-[28-47] reserved
-[48-255] payload (208 bytes)
-```
-
-### Чтение логов из ring buffer
-
-Используйте утилиту `log_reader` для чтения логов в реальном времени:
+### Чтение логов
 
 ```bash
-# Собрать log_reader
-cargo build --release --bin log_reader
+# Просмотр логов в реальном времени
+tail -f /dev/shm/ring_spsc_binance_f_log
 
-# Читать логи
-./target/release/log_reader /dev/shm/ring_spsc_binance_f_log
+# Или через journalctl (если запущено как systemd service)
+sudo journalctl -u binance-futures-writer -f
 ```
 
 Пример вывода:
@@ -147,16 +117,7 @@ cargo build --release --bin log_reader
 [1234567890123459] [WARN] Connection lost: wss://fstream.binance.com/...
 ```
 
-Также критические события (ERROR, WARNING) дублируются в stderr для быстрого обнаружения проблем.
-
-### Преимущества реализации
-
-- **Lock-free**: SPSC ring buffer без мьютексов
-- **Правильный memory ordering**: Release/Acquire для корректной видимости
-- **Фиксированный размер**: Ровно 256 байт на сообщение (align 8)
-- **ABI версионирование**: Совместимость между reader/writer
-- **Publish после memcpy**: Никогда не будет частично записанных сообщений
-- **Степень двойки**: Быстрое вычисление индекса через битовую маску
+Критические события (ERROR, WARNING) также дублируются в stderr для быстрого обнаружения проблем.
 
 ## Формат файлов конфигурации
 
