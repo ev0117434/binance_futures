@@ -9,12 +9,12 @@ Rust-реализация writer'а для записи котировок Binan
 ## Особенности
 
 - Lock-free запись в SHM с использованием seqlock
-- SPSC ring buffer для асинхронного логирования в shared memory
 - Поддержка до 512 символов на одно WebSocket соединение
 - Автоматический reconnect с exponential backoff
 - Использование локального времени (UNIX microseconds)
 - Точный парсинг decimal чисел без float ошибок
 - Минимальная задержка записи
+- Без логов на hot-path (только stderr для критических ошибок)
 
 ## Требования
 
@@ -88,76 +88,6 @@ sudo journalctl -u binance-futures-writer -f
 3. Подключается к Binance Futures WebSocket
 4. Начинает записывать котировки в SHM
 
-## Логирование
-
-Программа использует **правильный SPSC ring buffer** в shared memory для асинхронного логирования без блокировки hot-path:
-
-- **Ring buffer путь**: `/dev/shm/ring_spsc_binance_f_log`
-- **Размер**: 8192 слота (настраивается `SPSC_RING_SLOTS` в `src/logger.rs`)
-- **Размер сообщения**: Фиксированно 256 байт
-- **Формат**: Бинарный SPSC ring buffer с правильным ABI
-- **Типы событий**:
-  - `INFO (1)` - информационные сообщения, включая записанные котировки
-  - `WARNING (2)` - предупреждения (отключения, parse failures)
-  - `ERROR (3)` - ошибки с контекстом
-
-### Спецификация SPSC Ring Buffer
-
-#### Header (128 байт)
-```
-magic:        0x53505343 ("SPSC")
-abi_version:  1
-msg_size:     256
-ring_slots:   8192 (степень двойки)
-data_offset:  128
-write_seq:    AtomicU64
-read_seq:     AtomicU64
-```
-
-#### Сообщение (256 байт)
-```
-[0-1]   abi_version: 1
-[2-3]   msg_type: 1=Info, 2=Warning, 3=Error
-[4-5]   msg_size: 256
-[6-7]   reserved
-[8-15]  timestamp_us
-[16-23] seq
-[24-27] payload_len (max 208)
-[28-47] reserved
-[48-255] payload (208 bytes)
-```
-
-### Чтение логов из ring buffer
-
-Используйте утилиту `log_reader` для чтения логов в реальном времени:
-
-```bash
-# Собрать log_reader
-cargo build --release --bin log_reader
-
-# Читать логи
-./target/release/log_reader /dev/shm/ring_spsc_binance_f_log
-```
-
-Пример вывода:
-```
-[1234567890123456] [INFO] Starting binance_futures_writer
-[1234567890123457] [INFO] Loaded 100 symbols from /root/siro/dictionaries/configs/symbols.tsv
-[1234567890123458] [QUOTE] symbol=BTCUSDT symbol_id=1 bid=4500000000000 ask=4500100000000 ts_us=1234567890123458
-[1234567890123459] [WARN] Connection lost: wss://fstream.binance.com/...
-```
-
-Также критические события (ERROR, WARNING) дублируются в stderr для быстрого обнаружения проблем.
-
-### Преимущества реализации
-
-- **Lock-free**: SPSC ring buffer без мьютексов
-- **Правильный memory ordering**: Release/Acquire для корректной видимости
-- **Фиксированный размер**: Ровно 256 байт на сообщение (align 8)
-- **ABI версионирование**: Совместимость между reader/writer
-- **Publish после memcpy**: Никогда не будет частично записанных сообщений
-- **Степень двойки**: Быстрое вычисление индекса через битовую маску
-
 ## Формат файлов конфигурации
 
 ### binance_futures.txt
@@ -223,7 +153,7 @@ struct Quote64 {
 - Используется seqlock для lock-free доступа
 - Парсинг decimal без float конвертации
 - Минимальные аллокации на hot-path
-- SPSC ring buffer для логирования не блокирует основной поток
+- Нет логов на hot-path (только stderr для критических ошибок)
 - Рекомендуется использовать CPU affinity для снижения jitter
 
 ### Оптимизация для production
