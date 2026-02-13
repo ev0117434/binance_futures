@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const RING_BUFFER_SIZE: usize = 65536; // 64K entries
-const LOG_PATH: &str = "/var/log/binance_futures_writer.log";
+const RING_PATH: &str = "/dev/shm/ring_spsc_binance_f_log";
 
 /// Log entry types for different events
 #[derive(Debug, Clone)]
@@ -132,18 +132,19 @@ impl Logger {
         // If we can't get the lock, drop the log entry to avoid blocking
     }
 
-    /// Consumer thread that reads from ring buffer and writes to file
+    /// Consumer thread that reads from ring buffer and writes to SHM ring buffer
     fn consumer_thread(mut consumer: ringbuf::HeapCons<LogEntry>) {
-        // Open log file for appending
+        // Open ring buffer in shared memory for appending
         let log_file = OpenOptions::new()
             .create(true)
-            .append(true)
-            .open(LOG_PATH);
+            .read(true)
+            .write(true)
+            .open(RING_PATH);
 
         let mut writer = match log_file {
             Ok(file) => Some(BufWriter::new(file)),
             Err(e) => {
-                eprintln!("[LOGGER ERROR] Failed to open log file {}: {}", LOG_PATH, e);
+                eprintln!("[LOGGER ERROR] Failed to open ring buffer {}: {}", RING_PATH, e);
                 eprintln!("[LOGGER INFO] Logging to stderr only");
                 None
             }
