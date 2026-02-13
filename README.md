@@ -90,22 +90,25 @@ sudo journalctl -u binance-futures-writer -f
 
 ## Логирование
 
-Программа использует асинхронное логирование через внутренний ring buffer, который не блокирует hot-path:
+Программа использует асинхронное логирование через SPSC ring buffer в shared memory:
 
-- **Лог файл**: `/dev/shm/ring_spsc_binance_f_log`
-- **Формат**: Текстовые логи с timestamp в microseconds
+- **SPSC ring buffer**: `/dev/shm/ring_spsc_binance_f_log` (должен быть создан заранее)
+- **Формат**: Фиксированные сообщения по 256 байт
 - **Типы событий**:
   - `INFO` - информационные сообщения, включая записанные котировки
   - `WARNING` - предупреждения (отключения, parse failures)
   - `ERROR` - ошибки с контекстом
 
+### Требования
+
+SPSC ring buffer должен быть создан **до запуска** программы. Writer **не создает** ring buffer, а только пишет в существующий.
+
 ### Чтение логов
 
-```bash
-# Просмотр логов в реальном времени
-tail -f /dev/shm/ring_spsc_binance_f_log
+Логи можно читать с помощью специального reader'а, который умеет читать из SPSC ring buffer, или через journalctl для stderr:
 
-# Или через journalctl (если запущено как systemd service)
+```bash
+# Просмотр stderr логов (критические события)
 sudo journalctl -u binance-futures-writer -f
 ```
 
@@ -117,7 +120,7 @@ sudo journalctl -u binance-futures-writer -f
 [1234567890123459] [WARN] Connection lost: wss://fstream.binance.com/...
 ```
 
-Критические события (ERROR, WARNING) также дублируются в stderr для быстрого обнаружения проблем.
+Критические события (ERROR, WARNING) дублируются в stderr для быстрого обнаружения проблем.
 
 ## Формат файлов конфигурации
 

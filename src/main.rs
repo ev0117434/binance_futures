@@ -1,5 +1,6 @@
 mod shm;
 mod symbols;
+mod spsc_writer;
 mod logger;
 
 use futures_util::StreamExt;

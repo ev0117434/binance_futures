@@ -1,12 +1,11 @@
-use ringbuf::traits::{Consumer, Observer, Producer, Split};
+use crate::spsc_writer::SpscWriter;
+use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::HeapRb;
-use std::fs::OpenOptions;
-use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const RING_BUFFER_SIZE: usize = 65536; // 64K entries (internal ringbuf)
-const LOG_PATH: &str = "/dev/shm/ring_spsc_binance_f_log";
+const SPSC_PATH: &str = "/dev/shm/ring_spsc_binance_f_log";
 
 /// Log entry types for different events
 #[derive(Debug, Clone)]
@@ -132,18 +131,16 @@ impl Logger {
         // If we can't get the lock, drop the log entry to avoid blocking
     }
 
-    /// Consumer thread that reads from ring buffer and writes to log file
+    /// Consumer thread that reads from ring buffer and writes to SPSC ring buffer
     fn consumer_thread(mut consumer: ringbuf::HeapCons<LogEntry>) {
-        // Open log file for appending
-        let log_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(LOG_PATH);
-
-        let mut writer = match log_file {
-            Ok(file) => Some(BufWriter::new(file)),
+        // Open existing SPSC ring buffer
+        let spsc_writer = match SpscWriter::open(SPSC_PATH) {
+            Ok(writer) => {
+                eprintln!("[LOGGER INFO] SPSC ring buffer opened at {}", SPSC_PATH);
+                Some(writer)
+            }
             Err(e) => {
-                eprintln!("[LOGGER ERROR] Failed to open log file {}: {}", LOG_PATH, e);
+                eprintln!("[LOGGER ERROR] Failed to open SPSC ring buffer {}: {}", SPSC_PATH, e);
                 eprintln!("[LOGGER INFO] Logging to stderr only");
                 None
             }
@@ -154,19 +151,17 @@ impl Logger {
             if let Some(entry) = consumer.try_pop() {
                 match entry {
                     LogEntry::Shutdown => {
-                        // Flush and exit
-                        if let Some(ref mut w) = writer {
-                            let _ = w.flush();
-                        }
+                        eprintln!("[LOGGER INFO] Shutdown signal received");
                         break;
                     }
                     _ => {
                         let log_line = Self::format_log_entry(&entry);
 
-                        // Write to file
-                        if let Some(ref mut w) = writer {
-                            if let Err(e) = writeln!(w, "{}", log_line) {
-                                eprintln!("[LOGGER ERROR] Failed to write to log file: {}", e);
+                        // Write to SPSC ring buffer
+                        if let Some(ref writer) = spsc_writer {
+                            let msg = SpscWriter::create_message(&log_line);
+                            if let Err(e) = writer.publish(&msg) {
+                                eprintln!("[LOGGER ERROR] Failed to publish to SPSC: {}", e);
                             }
                         }
 
@@ -177,13 +172,6 @@ impl Logger {
                             }
                             _ => {}
                         }
-                    }
-                }
-
-                // Flush periodically (every batch or when empty)
-                if consumer.is_empty() {
-                    if let Some(ref mut w) = writer {
-                        let _ = w.flush();
                     }
                 }
             } else {
