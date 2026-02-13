@@ -1,5 +1,6 @@
 mod shm;
 mod symbols;
+mod logger;
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -8,10 +9,13 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use logger::Logger;
 
 const SUBSCRIBE_FILE: &str = "/root/siro/dictionaries/subscribe/binance/binance_futures.txt";
 const SYMBOLS_TSV: &str = "/root/siro/dictionaries/configs/symbols.tsv";
 const SHM_PATH: &str = "/dev/shm/quotes_v1.dat";
+const LOG_PATH: &str = "/var/log/binance_futures_writer.log";
+const LOG_RING_SIZE: usize = 8192;
 const SOURCE_ID: u64 = 1;
 const STREAMS_PER_CONNECTION: usize = 512;
 const PRICE_SCALE: i64 = 100_000_000; // 1e8
@@ -89,16 +93,17 @@ async fn run_websocket_connection(
     url: String,
     symbol_map: Arc<HashMap<String, u64>>,
     shm: Arc<shm::ShmWriter>,
+    logger: Arc<Logger>,
 ) -> Result<(), String> {
     let mut backoff = Duration::from_millis(200);
     let max_backoff = Duration::from_secs(30);
 
     loop {
-        eprintln!("[INFO] Connecting to {}", url);
+        log_info!(logger, "Connecting to {}", url);
 
         match connect_async(&url).await {
             Ok((ws_stream, _)) => {
-                eprintln!("[INFO] Connected to {}", url);
+                log_info!(logger, "Connected to {}", url);
                 backoff = Duration::from_millis(200);
 
                 let (mut _write, mut read) = ws_stream.split();
@@ -125,42 +130,42 @@ async fn run_websocket_connection(
                                                     ask_i64,
                                                     ts_us,
                                                 ) {
-                                                    eprintln!("[ERROR] Failed to write quote for {}: {}", symbol, e);
+                                                    log_error!(logger, "Failed to write quote for {}: {}", symbol, e);
                                                     std::process::exit(11);
                                                 }
                                             }
                                             (Err(e), _) | (_, Err(e)) => {
-                                                eprintln!("[ERROR] Failed to parse price for {}: {}", symbol, e);
+                                                log_error!(logger, "Failed to parse price for {}: {}", symbol, e);
                                             }
                                         }
                                     } else {
-                                        eprintln!("[ERROR] Symbol {} not in map", symbol);
+                                        log_error!(logger, "Symbol {} not in map", symbol);
                                         std::process::exit(10);
                                     }
                                 }
                                 Err(e) => {
-                                    eprintln!("[WARN] Failed to parse message: {}", e);
+                                    log_warn!(logger, "Failed to parse message: {}", e);
                                 }
                             }
                         }
                         Ok(Message::Ping(_)) => {}
                         Ok(Message::Pong(_)) => {}
                         Ok(Message::Close(_)) => {
-                            eprintln!("[WARN] Connection closed");
+                            log_warn!(logger, "Connection closed");
                             break;
                         }
                         Err(e) => {
-                            eprintln!("[ERROR] WebSocket error: {}", e);
+                            log_error!(logger, "WebSocket error: {}", e);
                             break;
                         }
                         _ => {}
                     }
                 }
 
-                eprintln!("[WARN] Connection lost, reconnecting...");
+                log_warn!(logger, "Connection lost, reconnecting...");
             }
             Err(e) => {
-                eprintln!("[ERROR] Failed to connect: {}", e);
+                log_error!(logger, "Failed to connect: {}", e);
             }
         }
 
@@ -171,32 +176,35 @@ async fn run_websocket_connection(
 
 #[tokio::main]
 async fn main() {
-    eprintln!("[INFO] Starting binance_futures_writer");
+    // Initialize async logger with SPSC ring buffer
+    let logger = Arc::new(Logger::new(LOG_RING_SIZE, LOG_PATH));
+
+    log_info!(logger, "Starting binance_futures_writer");
 
     let mapper = match symbols::SymbolMapper::load_from_tsv(SYMBOLS_TSV) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("[FATAL] {}", e);
+            log_fatal!(logger, "{}", e);
             std::process::exit(20);
         }
     };
 
-    eprintln!("[INFO] Loaded {} symbols from {}", mapper.len(), SYMBOLS_TSV);
+    log_info!(logger, "Loaded {} symbols from {}", mapper.len(), SYMBOLS_TSV);
 
     let subscribe_symbols = match symbols::load_subscribe_list(SUBSCRIBE_FILE) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[FATAL] {}", e);
+            log_fatal!(logger, "{}", e);
             std::process::exit(20);
         }
     };
 
-    eprintln!("[INFO] Loaded {} symbols to subscribe from {}", subscribe_symbols.len(), SUBSCRIBE_FILE);
+    log_info!(logger, "Loaded {} symbols to subscribe from {}", subscribe_symbols.len(), SUBSCRIBE_FILE);
 
     let symbol_map = match symbols::validate_symbols(&subscribe_symbols, &mapper) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("[FATAL] {}", e);
+            log_fatal!(logger, "{}", e);
             std::process::exit(20);
         }
     };
@@ -204,19 +212,19 @@ async fn main() {
     let shm = match shm::ShmWriter::open(SHM_PATH) {
         Ok(s) => Arc::new(s),
         Err(e) => {
-            eprintln!("[FATAL] {}", e);
+            log_fatal!(logger, "{}", e);
             std::process::exit(1);
         }
     };
 
-    eprintln!("[INFO] SHM opened successfully");
+    log_info!(logger, "SHM opened successfully");
 
     let chunks: Vec<Vec<String>> = subscribe_symbols
         .chunks(STREAMS_PER_CONNECTION)
         .map(|chunk| chunk.to_vec())
         .collect();
 
-    eprintln!("[INFO] Created {} connection(s) for {} symbols", chunks.len(), subscribe_symbols.len());
+    log_info!(logger, "Created {} connection(s) for {} symbols", chunks.len(), subscribe_symbols.len());
 
     let symbol_map = Arc::new(symbol_map);
     let mut handles = vec![];
@@ -234,9 +242,10 @@ async fn main() {
 
         let symbol_map_clone = Arc::clone(&symbol_map);
         let shm_clone = Arc::clone(&shm);
+        let logger_clone = Arc::clone(&logger);
 
         let handle = tokio::spawn(async move {
-            if let Err(e) = run_websocket_connection(url, symbol_map_clone, shm_clone).await {
+            if let Err(e) = run_websocket_connection(url, symbol_map_clone, shm_clone, logger_clone).await {
                 eprintln!("[FATAL] Connection {} failed: {}", idx, e);
                 std::process::exit(2);
             }
@@ -251,7 +260,7 @@ async fn main() {
 
     for handle in handles {
         if let Err(e) = handle.await {
-            eprintln!("[FATAL] Task failed: {}", e);
+            log_fatal!(logger, "Task failed: {}", e);
             std::process::exit(3);
         }
     }
