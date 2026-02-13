@@ -1,12 +1,11 @@
-use crate::spsc_ring::{MsgType, SpscWriter};
+use crate::spsc_writer::SpscWriter;
 use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::HeapRb;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const RING_BUFFER_SIZE: usize = 65536; // 64K entries (internal ringbuf)
-const RING_PATH: &str = "/dev/shm/ring_spsc_binance_f_log";
-const SPSC_RING_SLOTS: u64 = 8192; // Must be power of 2 (8K messages = 2MB)
+const SPSC_PATH: &str = "/dev/shm/ring_spsc_binance_f_log";
 
 /// Log entry types for different events
 #[derive(Debug, Clone)]
@@ -132,22 +131,20 @@ impl Logger {
         // If we can't get the lock, drop the log entry to avoid blocking
     }
 
-    /// Consumer thread that reads from ring buffer and writes to SHM SPSC ring buffer
+    /// Consumer thread that reads from ring buffer and writes to SPSC ring buffer
     fn consumer_thread(mut consumer: ringbuf::HeapCons<LogEntry>) {
-        // Open SPSC ring buffer in shared memory
-        let spsc_writer = match SpscWriter::open(RING_PATH, SPSC_RING_SLOTS) {
+        // Open existing SPSC ring buffer
+        let spsc_writer = match SpscWriter::open(SPSC_PATH) {
             Ok(writer) => {
-                eprintln!("[LOGGER INFO] SPSC ring buffer opened at {}", RING_PATH);
+                eprintln!("[LOGGER INFO] SPSC ring buffer opened at {}", SPSC_PATH);
                 Some(writer)
             }
             Err(e) => {
-                eprintln!("[LOGGER ERROR] Failed to open SPSC ring buffer {}: {}", RING_PATH, e);
+                eprintln!("[LOGGER ERROR] Failed to open SPSC ring buffer {}: {}", SPSC_PATH, e);
                 eprintln!("[LOGGER INFO] Logging to stderr only");
                 None
             }
         };
-
-        let mut msg_seq = 0u64;
 
         loop {
             // Wait for entries (non-blocking poll)
@@ -159,32 +156,13 @@ impl Logger {
                     }
                     _ => {
                         let log_line = Self::format_log_entry(&entry);
-                        let timestamp_us = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_micros() as i64;
-
-                        // Determine message type
-                        let msg_type = match &entry {
-                            LogEntry::Error { .. } => MsgType::Error,
-                            LogEntry::Warning { .. } => MsgType::Warning,
-                            _ => MsgType::Info,
-                        };
 
                         // Write to SPSC ring buffer
                         if let Some(ref writer) = spsc_writer {
-                            let msg = SpscWriter::create_message(
-                                msg_type,
-                                timestamp_us,
-                                msg_seq,
-                                log_line.as_bytes(),
-                            );
-
+                            let msg = SpscWriter::create_message(&log_line);
                             if let Err(e) = writer.publish(&msg) {
-                                eprintln!("[LOGGER ERROR] Failed to publish to SPSC ring: {}", e);
+                                eprintln!("[LOGGER ERROR] Failed to publish to SPSC: {}", e);
                             }
-
-                            msg_seq = msg_seq.wrapping_add(1);
                         }
 
                         // Also write critical events to stderr
