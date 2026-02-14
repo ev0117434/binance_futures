@@ -3,19 +3,29 @@ use std::fs::OpenOptions;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAGIC: u32 = 0x53505343; // "SPSC" in hex
-const ABI_VERSION: u32 = 1;
+const ABI_VERSION: u16 = 1;
 const MSG_SIZE: usize = 256;
 
 /// SPSC Ring Buffer Header (in shared memory)
+/// Layout (little-endian):
+/// - offset 0x00: u32 magic
+/// - offset 0x04: u16 abi_version
+/// - offset 0x06: u16 layout_version
+/// - offset 0x08: u16 msg_size
+/// - offset 0x0A: u16 flags
+/// - offset 0x0C: u32 ring_slots
+/// - offset 0x10: u64 _reserved0
+/// - offset 0x18: u64 write_seq (atomic)
 #[repr(C)]
 struct RingHeader {
-    magic: u32,
-    abi_version: u32,
-    msg_size: u32,
-    ring_slots: u32,
-    layout_version: u32,
-    _reserved: [u32; 3],
-    write_seq: AtomicU64,
+    magic: u32,           // 0x00
+    abi_version: u16,     // 0x04
+    layout_version: u16,  // 0x06
+    msg_size: u16,        // 0x08
+    flags: u16,           // 0x0A
+    ring_slots: u32,      // 0x0C
+    _reserved0: u64,      // 0x10
+    write_seq: AtomicU64, // 0x18
 }
 
 pub struct RingWriter {
@@ -57,7 +67,7 @@ impl RingWriter {
                 ));
             }
 
-            // Check ABI version
+            // Check ABI version (u16)
             if header.abi_version != ABI_VERSION {
                 return Err(format!(
                     "Invalid abi_version: expected {}, got {}",
@@ -65,7 +75,7 @@ impl RingWriter {
                 ));
             }
 
-            // Check message size
+            // Check message size (u16)
             if header.msg_size as usize != MSG_SIZE {
                 return Err(format!(
                     "Invalid msg_size: expected {}, got {}",
