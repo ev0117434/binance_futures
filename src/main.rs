@@ -1,21 +1,25 @@
 mod shm;
 mod symbols;
-mod logger;
+mod spsc_ring;
+mod metrics;
+mod message_builder;
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use logger::Logger;
+use spsc_ring::RingWriter;
+use metrics::{Metrics, WsState, ErrorDomain, now_ms};
+use message_builder::*;
 
 const SUBSCRIBE_FILE: &str = "/root/siro/dictionaries/subscribe/binance/binance_futures.txt";
 const SYMBOLS_TSV: &str = "/root/siro/dictionaries/configs/symbols.tsv";
 const SHM_PATH: &str = "/dev/shm/quotes_v1.dat";
-const LOG_PATH: &str = "/var/log/binance_futures_writer.log";
-const LOG_RING_SIZE: usize = 8192;
+const SPSC_RING_PATH: &str = "/dev/shm/binance_futures_metrics.ring";
+const SNAPSHOT_INTERVAL_MS: u64 = 5000; // 5 seconds
 const SOURCE_ID: u64 = 1;
 const STREAMS_PER_CONNECTION: usize = 512;
 const PRICE_SCALE: i64 = 100_000_000; // 1e8
@@ -93,79 +97,230 @@ async fn run_websocket_connection(
     url: String,
     symbol_map: Arc<HashMap<String, u64>>,
     shm: Arc<shm::ShmWriter>,
-    logger: Arc<Logger>,
+    ring: Arc<RingWriter>,
+    metrics: Arc<Mutex<Metrics>>,
 ) -> Result<(), String> {
     let mut backoff = Duration::from_millis(200);
     let max_backoff = Duration::from_secs(30);
+    let mut next_snapshot_ms = now_ms() + SNAPSHOT_INTERVAL_MS;
 
     loop {
-        log_info!(logger, "Connecting to {}", url);
+        // Update metrics: new session
+        {
+            let mut m = metrics.lock().unwrap();
+            m.new_session();
+            m.ws_state = WsState::Connecting;
+        }
+
+        eprintln!("[INFO] Connecting to {}", url);
 
         match connect_async(&url).await {
             Ok((ws_stream, _)) => {
-                log_info!(logger, "Connected to {}", url);
+                eprintln!("[INFO] Connected to {}", url);
+
+                // Update metrics: connected
+                {
+                    let mut m = metrics.lock().unwrap();
+                    m.ws_state = WsState::Running;
+                }
+
                 backoff = Duration::from_millis(200);
 
                 let (mut _write, mut read) = ws_stream.split();
 
-                while let Some(msg) = read.next().await {
-                    match msg {
+                while let Some(msg_result) = read.next().await {
+                    // Check if snapshot is due
+                    let current_ms = now_ms();
+                    if current_ms >= next_snapshot_ms {
+                        let msg = {
+                            let mut m = metrics.lock().unwrap();
+                            m.log_seq += 1;
+                            build_snapshot_periodic(&mut m)
+                        };
+                        let _ = ring.publish(&msg);
+                        next_snapshot_ms += SNAPSHOT_INTERVAL_MS;
+                    }
+
+                    match msg_result {
                         Ok(Message::Text(text)) => {
+                            let t_rx_ms = now_ms();
+
+                            // Update WS frame metrics
+                            {
+                                let mut m = metrics.lock().unwrap();
+                                m.ws_last_frame_rx_ms = t_rx_ms;
+                                m.ws_rx_frames_total += 1;
+                                m.ws_rx_bytes_total += text.len() as u64;
+                            }
+
                             match serde_json::from_str::<BookTickerMessage>(&text) {
                                 Ok(book_ticker) => {
+                                    let t_parsed_ms = now_ms();
+
                                     let symbol = &book_ticker.data.symbol;
 
                                     if let Some(&symbol_id) = symbol_map.get(symbol) {
+                                        // Update WS data received metrics
+                                        {
+                                            let mut m = metrics.lock().unwrap();
+                                            m.ws_last_data_rx_ms = t_parsed_ms;
+                                            m.ws_rx_msgs_total += 1;
+                                        }
+
                                         match (
                                             parse_decimal_to_scaled(&book_ticker.data.bid, PRICE_SCALE),
                                             parse_decimal_to_scaled(&book_ticker.data.ask, PRICE_SCALE),
                                         ) {
                                             (Ok(bid_i64), Ok(ask_i64)) => {
+                                                let t_mapped_ms = now_ms();
                                                 let ts_us = get_monotonic_us();
 
-                                                if let Err(e) = shm.write_quote(
+                                                if let Err(_e) = shm.write_quote(
                                                     SOURCE_ID,
                                                     symbol_id,
                                                     bid_i64,
                                                     ask_i64,
                                                     ts_us,
                                                 ) {
-                                                    log_error!(logger, "Failed to write quote for {}: {}", symbol, e);
+                                                    let t_fail_ms = now_ms();
+
+                                                    // Update SHM write fail metrics
+                                                    {
+                                                        let mut m = metrics.lock().unwrap();
+                                                        m.shm_write_fail_total += 1;
+                                                        m.shm_last_write_fail_ms = t_fail_ms;
+                                                        m.ws_last_error_code = -1;
+                                                        m.log_seq += 1;
+
+                                                        let error_msg = build_event_error(
+                                                            &m,
+                                                            ErrorDomain::SHM,
+                                                            -1,
+                                                            0,
+                                                            0,
+                                                            0,
+                                                        );
+                                                        let _ = ring.publish(&error_msg);
+                                                    }
+
                                                     std::process::exit(11);
+                                                } else {
+                                                    let t_written_ms = now_ms();
+
+                                                    // Update SHM write success metrics and latency
+                                                    {
+                                                        let mut m = metrics.lock().unwrap();
+                                                        m.shm_write_ok_total += 1;
+                                                        m.shm_last_write_ok_ms = t_written_ms;
+
+                                                        // Calculate and record latency
+                                                        let lat_ms = (t_written_ms - t_rx_ms) as u32;
+                                                        m.lat_rx_to_written.record(lat_ms);
+                                                    }
                                                 }
                                             }
-                                            (Err(e), _) | (_, Err(e)) => {
-                                                log_error!(logger, "Failed to parse price for {}: {}", symbol, e);
+                                            (Err(_e), _) | (_, Err(_e)) => {
+                                                // Update parse error metrics
+                                                let mut m = metrics.lock().unwrap();
+                                                m.ws_parse_error_total += 1;
                                             }
                                         }
                                     } else {
-                                        log_error!(logger, "Symbol {} not in map", symbol);
+                                        // Symbol not in map - fatal error
+                                        eprintln!("[ERROR] Symbol {} not in map", symbol);
                                         std::process::exit(10);
                                     }
                                 }
-                                Err(e) => {
-                                    log_warn!(logger, "Failed to parse message: {}", e);
+                                Err(_e) => {
+                                    // Update parse error metrics
+                                    let mut m = metrics.lock().unwrap();
+                                    m.ws_parse_error_total += 1;
                                 }
                             }
                         }
-                        Ok(Message::Ping(_)) => {}
-                        Ok(Message::Pong(_)) => {}
-                        Ok(Message::Close(_)) => {
-                            log_warn!(logger, "Connection closed");
+                        Ok(Message::Ping(_)) => {
+                            let t_ms = now_ms();
+                            let mut m = metrics.lock().unwrap();
+                            m.ws_last_frame_rx_ms = t_ms;
+                            m.ws_rx_frames_total += 1;
+                        }
+                        Ok(Message::Pong(_)) => {
+                            let t_ms = now_ms();
+                            let mut m = metrics.lock().unwrap();
+                            m.ws_last_frame_rx_ms = t_ms;
+                            m.ws_rx_frames_total += 1;
+                        }
+                        Ok(Message::Close(frame)) => {
+                            eprintln!("[WARN] Connection closed");
+
+                            let close_code = frame.as_ref().map(|f| f.code.into()).unwrap_or(0);
+
+                            // Update metrics
+                            {
+                                let mut m = metrics.lock().unwrap();
+                                m.ws_disconnect_total += 1;
+                                m.ws_last_close_code = close_code;
+                                m.ws_state = WsState::Reconnecting;
+                            }
+
                             break;
                         }
-                        Err(e) => {
-                            log_error!(logger, "WebSocket error: {}", e);
+                        Err(_e) => {
+                            eprintln!("[ERROR] WebSocket error");
+
+                            // Update metrics
+                            {
+                                let mut m = metrics.lock().unwrap();
+                                m.ws_protocol_error_total += 1;
+                                m.ws_last_error_ms = now_ms();
+                                m.ws_state = WsState::Reconnecting;
+                            }
+
                             break;
                         }
                         _ => {}
                     }
                 }
 
-                log_warn!(logger, "Connection lost, reconnecting...");
+                eprintln!("[WARN] Connection lost, reconnecting...");
+
+                // Update reconnect metrics
+                {
+                    let mut m = metrics.lock().unwrap();
+                    m.ws_reconnect_total += 1;
+                    m.log_seq += 1;
+
+                    let error_msg = build_event_error(
+                        &m,
+                        ErrorDomain::WS,
+                        -2,
+                        0,
+                        0,
+                        m.session_id as u64,
+                    );
+                    let _ = ring.publish(&error_msg);
+                }
             }
-            Err(e) => {
-                log_error!(logger, "Failed to connect: {}", e);
+            Err(_e) => {
+                eprintln!("[ERROR] Failed to connect");
+
+                // Update handshake fail metrics
+                {
+                    let mut m = metrics.lock().unwrap();
+                    m.ws_handshake_fail_total += 1;
+                    m.ws_last_error_ms = now_ms();
+                    m.log_seq += 1;
+
+                    let error_msg = build_event_error(
+                        &m,
+                        ErrorDomain::WS,
+                        -3,
+                        0,
+                        0,
+                        0,
+                    );
+                    let _ = ring.publish(&error_msg);
+                }
             }
         }
 
@@ -176,35 +331,32 @@ async fn run_websocket_connection(
 
 #[tokio::main]
 async fn main() {
-    // Initialize async logger with SPSC ring buffer
-    let logger = Arc::new(Logger::new(LOG_RING_SIZE, LOG_PATH));
-
-    log_info!(logger, "Starting binance_futures_writer");
+    eprintln!("[INFO] Starting binance_futures_writer with SPSC ring metrics");
 
     let mapper = match symbols::SymbolMapper::load_from_tsv(SYMBOLS_TSV) {
         Ok(m) => m,
         Err(e) => {
-            log_fatal!(logger, "{}", e);
+            eprintln!("[FATAL] {}", e);
             std::process::exit(20);
         }
     };
 
-    log_info!(logger, "Loaded {} symbols from {}", mapper.len(), SYMBOLS_TSV);
+    eprintln!("[INFO] Loaded {} symbols from {}", mapper.len(), SYMBOLS_TSV);
 
     let subscribe_symbols = match symbols::load_subscribe_list(SUBSCRIBE_FILE) {
         Ok(s) => s,
         Err(e) => {
-            log_fatal!(logger, "{}", e);
+            eprintln!("[FATAL] {}", e);
             std::process::exit(20);
         }
     };
 
-    log_info!(logger, "Loaded {} symbols to subscribe from {}", subscribe_symbols.len(), SUBSCRIBE_FILE);
+    eprintln!("[INFO] Loaded {} symbols to subscribe from {}", subscribe_symbols.len(), SUBSCRIBE_FILE);
 
     let symbol_map = match symbols::validate_symbols(&subscribe_symbols, &mapper) {
         Ok(m) => m,
         Err(e) => {
-            log_fatal!(logger, "{}", e);
+            eprintln!("[FATAL] {}", e);
             std::process::exit(20);
         }
     };
@@ -212,19 +364,51 @@ async fn main() {
     let shm = match shm::ShmWriter::open(SHM_PATH) {
         Ok(s) => Arc::new(s),
         Err(e) => {
-            log_fatal!(logger, "{}", e);
+            eprintln!("[FATAL] {}", e);
             std::process::exit(1);
         }
     };
 
-    log_info!(logger, "SHM opened successfully");
+    eprintln!("[INFO] SHM opened successfully");
+
+    // Open SPSC ring for metrics
+    let ring = match RingWriter::open(SPSC_RING_PATH) {
+        Ok(r) => Arc::new(r),
+        Err(e) => {
+            eprintln!("[FATAL] Failed to open SPSC ring: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    eprintln!("[INFO] SPSC ring opened successfully");
+
+    // Initialize metrics
+    let metrics = Arc::new(Mutex::new(Metrics::new()));
+
+    // Publish SNAPSHOT_START
+    {
+        let mut m = metrics.lock().unwrap();
+        m.log_seq += 1;
+        let start_msg = build_snapshot_start(
+            &m,
+            subscribe_symbols.len() as u32,
+            "wss://fstream.binance.com/stream",
+            1024, // example ring size
+        );
+        if let Err(e) = ring.publish(&start_msg) {
+            eprintln!("[FATAL] Failed to publish SNAPSHOT_START: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    eprintln!("[INFO] Published SNAPSHOT_START");
 
     let chunks: Vec<Vec<String>> = subscribe_symbols
         .chunks(STREAMS_PER_CONNECTION)
         .map(|chunk| chunk.to_vec())
         .collect();
 
-    log_info!(logger, "Created {} connection(s) for {} symbols", chunks.len(), subscribe_symbols.len());
+    eprintln!("[INFO] Created {} connection(s) for {} symbols", chunks.len(), subscribe_symbols.len());
 
     let symbol_map = Arc::new(symbol_map);
     let mut handles = vec![];
@@ -242,10 +426,11 @@ async fn main() {
 
         let symbol_map_clone = Arc::clone(&symbol_map);
         let shm_clone = Arc::clone(&shm);
-        let logger_clone = Arc::clone(&logger);
+        let ring_clone = Arc::clone(&ring);
+        let metrics_clone = Arc::clone(&metrics);
 
         let handle = tokio::spawn(async move {
-            if let Err(e) = run_websocket_connection(url, symbol_map_clone, shm_clone, logger_clone).await {
+            if let Err(e) = run_websocket_connection(url, symbol_map_clone, shm_clone, ring_clone, metrics_clone).await {
                 eprintln!("[FATAL] Connection {} failed: {}", idx, e);
                 std::process::exit(2);
             }
@@ -260,7 +445,7 @@ async fn main() {
 
     for handle in handles {
         if let Err(e) = handle.await {
-            log_fatal!(logger, "Task failed: {}", e);
+            eprintln!("[FATAL] Task failed: {}", e);
             std::process::exit(3);
         }
     }
