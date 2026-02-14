@@ -18,7 +18,7 @@ use message_builder::*;
 const SUBSCRIBE_FILE: &str = "/root/siro/dictionaries/subscribe/binance/binance_futures.txt";
 const SYMBOLS_TSV: &str = "/root/siro/dictionaries/configs/symbols.tsv";
 const SHM_PATH: &str = "/dev/shm/quotes_v1.dat";
-const SPSC_RING_PATH: &str = "/dev/shm/binance_futures_metrics.ring";
+const SPSC_RING_PATH: &str = "/dev/shm/ring_spsc_binance_f_log";
 const SNAPSHOT_INTERVAL_MS: u64 = 5000; // 5 seconds
 const SOURCE_ID: u64 = 1;
 const STREAMS_PER_CONNECTION: usize = 512;
